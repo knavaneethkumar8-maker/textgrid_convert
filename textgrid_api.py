@@ -3,7 +3,6 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
-import tempfile
 
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
@@ -20,7 +19,7 @@ TEXTGRID_DIR = BASE_UPLOAD / "textgrids"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 TEXTGRID_DIR.mkdir(parents=True, exist_ok=True)
 
-app.config['ALLOWED_EXTENSIONS'] = {'textgrid'}
+GRID_MS = 216
 
 TIER_NAME_MAP = {
     "आकाश": "akash",
@@ -29,8 +28,6 @@ TIER_NAME_MAP = {
     "जल": "jal",
     "पृथ्वी": "prithvi"
 }
-
-GRID_MS = 216
 
 TIER_DEFS = [
     {"key": "akash",   "name": "आकाश",   "step": 216},
@@ -41,8 +38,11 @@ TIER_DEFS = [
 ]
 
 # ---------------- HELPERS ----------------
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+def is_wav(name):
+    return name.lower().endswith(".wav")
+
+def is_textgrid(name):
+    return name.lower().endswith(".textgrid")
 
 def detect_encoding(file_path):
     for enc in ['utf-8-sig', 'utf-16', 'utf-8', 'latin-1']:
@@ -203,12 +203,15 @@ def frontend():
     return render_template("index.html")
 
 @app.route('/upload', methods=['POST'])
-def upload():
+def upload_single():
     audio = request.files.get("audio")
     textgrid = request.files.get("textgrid")
 
     if not audio or not textgrid:
         return render_template("index.html", message="Missing files")
+
+    if not is_wav(audio.filename) or not is_textgrid(textgrid.filename):
+        return render_template("index.html", message="Invalid file types")
 
     audio_name = secure_filename(audio.filename)
     tg_name = secure_filename(textgrid.filename)
@@ -222,13 +225,49 @@ def upload():
     audio_id = Path(audio_name).stem
     result = parse_textgrid_to_grids(tg_path, audio_id)
 
-    json_path = TEXTGRID_DIR / f"{audio_id}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
+    with open(TEXTGRID_DIR / f"{audio_id}.json", "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+
+    return render_template("index.html", message=f"Converted {audio_name}")
+
+@app.route('/upload-folder', methods=['POST'])
+def upload_folder():
+    files = request.files.getlist("folder")
+
+    audio_map = {}
+    tg_map = {}
+
+    for f in files:
+        name = secure_filename(os.path.basename(f.filename))
+        stem = Path(name).stem
+
+        if is_wav(name):
+            audio_map[stem] = f
+        elif is_textgrid(name):
+            tg_map[stem] = f
+
+    processed = 0
+
+    for audio_id in audio_map.keys() & tg_map.keys():
+        audio = audio_map[audio_id]
+        tg = tg_map[audio_id]
+
+        audio_path = AUDIO_DIR / secure_filename(audio.filename)
+        tg_path = TEXTGRID_DIR / secure_filename(tg.filename)
+
+        audio.save(audio_path)
+        tg.save(tg_path)
+
+        result = parse_textgrid_to_grids(tg_path, audio_id)
+
+        with open(TEXTGRID_DIR / f"{audio_id}.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+        processed += 1
 
     return render_template(
         "index.html",
-        message=f"Success! Saved {audio_name} and {audio_id}.json"
+        message=f"Batch complete: {processed} file pairs converted"
     )
 
 @app.route('/health')
