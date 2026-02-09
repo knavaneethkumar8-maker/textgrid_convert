@@ -10,7 +10,7 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
+app.config['MAX_CONTENT_LENGTH'] = 1000 * 1024 * 1024  # 16MB
 
 BASE_UPLOAD = Path("uploads")
 AUDIO_DIR = BASE_UPLOAD / "recordings"
