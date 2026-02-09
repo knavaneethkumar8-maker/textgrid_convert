@@ -1,8 +1,9 @@
 import json
 import math
-import os
+import requests
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
@@ -10,14 +11,10 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
-app.config['MAX_CONTENT_LENGTH'] = 1000 * 1024 * 1024  # 16MB
+backendOrigin = "https://api.xn--l2bot2c0c.com/api/textgrid/full-upload"
+localBackend = "http://127.0.0.1:3500/api/textgrid/full-upload"
 
-BASE_UPLOAD = Path("uploads")
-AUDIO_DIR = BASE_UPLOAD / "recordings"
-TEXTGRID_DIR = BASE_UPLOAD / "textgrids"
-
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-TEXTGRID_DIR.mkdir(parents=True, exist_ok=True)
+NODE_UPLOAD_URL = backendOrigin
 
 GRID_MS = 216
 
@@ -44,31 +41,34 @@ def is_wav(name):
 def is_textgrid(name):
     return name.lower().endswith(".textgrid")
 
-def detect_encoding(file_path):
-    for enc in ['utf-8-sig', 'utf-16', 'utf-8', 'latin-1']:
-        try:
-            with open(file_path, 'r', encoding=enc) as f:
-                f.read(100)
-            return enc
-        except:
-            continue
-    return 'utf-8'
-
-# ---------------- CORE ----------------
-def parse_textgrid_to_grids(textgrid_path, audio_id):
-    tg_text = None
+def read_textgrid(textgrid_path):
     for enc in ['utf-8-sig', 'utf-16', 'utf-8', 'latin-1']:
         try:
             with open(textgrid_path, 'r', encoding=enc) as f:
-                tg_text = f.read()
-            break
+                return f.read()
         except:
             continue
+    raise RuntimeError("Unable to decode TextGrid")
 
-    if tg_text is None:
-        enc = detect_encoding(textgrid_path)
-        with open(textgrid_path, 'r', encoding=enc) as f:
-            tg_text = f.read()
+def send_to_nodejs(wav_path, tg_path, json_path):
+    files = {
+        "audio": open(wav_path, "rb"),
+        "textgrid": open(tg_path, "rb"),
+        "json": open(json_path, "rb")
+    }
+
+    try:
+        r = requests.post(NODE_UPLOAD_URL, files=files, timeout=120)
+        return r.status_code, r.text
+    except Exception as e:
+        return 500, str(e)
+    finally:
+        for f in files.values():
+            f.close()
+
+# ---------------- CORE ----------------
+def parse_textgrid_to_grids(textgrid_path, audio_id):
+    tg_text = read_textgrid(textgrid_path)
 
     lines = [l.strip() for l in tg_text.splitlines()]
     i = 0
@@ -190,8 +190,8 @@ def parse_textgrid_to_grids(textgrid_path, audio_id):
         "metadata": {
             "file_name": f"{audio_id}.json",
             "file_id": f"DATASETS-{audio_id}",
-            "owner": "username",
-            "status": "FINISHED",
+            "owner": "ml",
+            "status": "PENDING",
             "created_at": datetime.utcnow().isoformat() + "Z"
         },
         "grids": grids
@@ -203,72 +203,44 @@ def frontend():
     return render_template("index.html")
 
 @app.route('/upload', methods=['POST'])
-def upload_single():
+def upload():
     audio = request.files.get("audio")
     textgrid = request.files.get("textgrid")
 
     if not audio or not textgrid:
-        return render_template("index.html", message="Missing files")
+        return render_template("index.html", message="Missing files", is_error=True)
 
     if not is_wav(audio.filename) or not is_textgrid(textgrid.filename):
-        return render_template("index.html", message="Invalid file types")
+        return render_template("index.html", message="Invalid file types", is_error=True)
 
     audio_name = secure_filename(audio.filename)
-    tg_name = secure_filename(textgrid.filename)
+    audio_id = audio_name
 
-    audio_path = AUDIO_DIR / audio_name
-    tg_path = TEXTGRID_DIR / tg_name
+    try:
+        with TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
 
-    audio.save(audio_path)
-    textgrid.save(tg_path)
+            wav_path = tmp / audio_name
+            tg_path = tmp / secure_filename(textgrid.filename)
+            json_path = tmp / f"{audio_id}.json"
 
-    audio_id = Path(audio_name).stem
-    result = parse_textgrid_to_grids(tg_path, audio_id)
+            audio.save(wav_path)
+            textgrid.save(tg_path)
 
-    with open(TEXTGRID_DIR / f"{audio_id}.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+            result = parse_textgrid_to_grids(tg_path, audio_id)
 
-    return render_template("index.html", message=f"Converted {audio_name}")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
 
-@app.route('/upload-folder', methods=['POST'])
-def upload_folder():
-    files = request.files.getlist("folder")
+            status, resp = send_to_nodejs(wav_path, tg_path, json_path)
 
-    audio_map = {}
-    tg_map = {}
+        if status != 200:
+            return render_template("index.html", message=f"Node upload failed: {resp}", is_error=True)
 
-    for f in files:
-        name = secure_filename(os.path.basename(f.filename))
-        stem = Path(name).stem
+        return render_template("index.html", message=f"Converted + Stored: {audio_name}", is_error=False)
 
-        if is_wav(name):
-            audio_map[stem] = f
-        elif is_textgrid(name):
-            tg_map[stem] = f
-
-    processed = 0
-
-    for audio_id in audio_map.keys() & tg_map.keys():
-        audio = audio_map[audio_id]
-        tg = tg_map[audio_id]
-
-        audio_path = AUDIO_DIR / secure_filename(audio.filename)
-        tg_path = TEXTGRID_DIR / secure_filename(tg.filename)
-
-        audio.save(audio_path)
-        tg.save(tg_path)
-
-        result = parse_textgrid_to_grids(tg_path, audio_id)
-
-        with open(TEXTGRID_DIR / f"{audio_id}.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-
-        processed += 1
-
-    return render_template(
-        "index.html",
-        message=f"Batch complete: {processed} file pairs converted"
-    )
+    except Exception as e:
+        return render_template("index.html", message=str(e), is_error=True)
 
 @app.route('/health')
 def health():
@@ -276,5 +248,5 @@ def health():
 
 # ---------------- RUN ----------------
 if __name__ == '__main__':
-    print("Running TextGrid Converter")
-    app.run(host='0.0.0.0', port=4500, debug=True)
+    print("Running TextGrid Converter → NodeJS Storage Bridge")
+    app.run(host='0.0.0.0', port=8010, debug=True)
